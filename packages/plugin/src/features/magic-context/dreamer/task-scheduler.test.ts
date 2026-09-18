@@ -714,3 +714,62 @@ describe("task-scheduler — message-activity provider threading", () => {
         expect(result.backlogBefore.retrospective).toEqual({ pending: 3, total: 3 });
     });
 });
+
+describe("task-scheduler — memory-activity gating", () => {
+    it("a provider reporting zero activity skips a due task even with a pool (pre-gate)", async () => {
+        db = freshDb();
+        seedActiveMemory(db);
+        const now = Date.now();
+        const tasks = [cfg("verify", "0 3 * * *")];
+        planDueTasks(db, PROJECT, tasks, now);
+        forceDue(db, "verify", now);
+
+        let ran = false;
+        const executor = async (): Promise<TaskExecOutcome> => {
+            ran = true;
+            return { status: "completed" };
+        };
+        const count = await runDueTasksForProject({
+            db,
+            projectIdentity: PROJECT,
+            tasks,
+            executor,
+            now,
+            messageActivity: stubActivity(0),
+        });
+        expect(count).toBe(0);
+        expect(ran).toBe(false);
+        expect(getTaskScheduleState(db, PROJECT, "verify")?.lastStatus).toBe("skipped");
+    });
+
+    it("the post-lease re-gate consults the provider (activity consumed mid-run)", async () => {
+        db = freshDb();
+        seedActiveMemory(db);
+        const now = Date.now();
+        const tasks = [cfg("verify", "0 3 * * *"), cfg("curate", "0 4 * * 0")];
+        planDueTasks(db, PROJECT, tasks, now);
+        forceDue(db, "verify", now);
+        forceDue(db, "curate", now);
+
+        // Both tasks pass the pre-gate with activity present; verify's executor
+        // consumes the new activity, so curate's POST-lease re-gate must fail.
+        let activity = 1;
+        const provider = { countRootSessionsWithMessagesSince: () => activity };
+        const ran: string[] = [];
+        const executor = async (c: DreamTaskRuntimeConfig): Promise<TaskExecOutcome> => {
+            ran.push(c.task);
+            if (c.task === "verify") activity = 0;
+            return { status: "completed" };
+        };
+        await runDueTasksForProject({
+            db,
+            projectIdentity: PROJECT,
+            tasks,
+            executor,
+            now,
+            messageActivity: provider,
+        });
+        expect(ran).toEqual(["verify"]);
+        expect(getTaskScheduleState(db, PROJECT, "curate")?.lastStatus).toBe("skipped");
+    });
+});

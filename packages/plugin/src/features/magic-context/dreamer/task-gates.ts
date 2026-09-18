@@ -43,6 +43,18 @@ export interface TaskGateContext {
     messageActivity?: MessageActivityProvider;
 }
 
+/** True when any ROOT session of the project has a message newer than
+ *  `sinceMs` (null → any root session). Conservative: a missing provider or
+ *  an unavailable message store returns true so legacy gates still apply. */
+function hasSessionActivitySince(ctx: TaskGateContext, sinceMs: number | null): boolean {
+    if (!ctx.messageActivity) return true;
+    const count = ctx.messageActivity.countRootSessionsWithMessagesSince(
+        ctx.projectIdentity,
+        sinceMs,
+    );
+    return count === null ? true : count > 0;
+}
+
 /** Raw status count used only to let curate transition expired active rows. */
 export function countActiveMemories(db: Database, projectPath: string): number {
     const row = db
@@ -366,34 +378,42 @@ export function evaluateTaskGate(task: DreamTaskName, ctx: TaskGateContext): boo
             return countUnmappedActiveMemories(db, project) > 0;
 
         case "verify":
-            // The executor's file gate does the precise incremental partition; the
-            // scheduler only avoids taking the memory lease when there is no live pool.
-            return countLiveMemories(db, project) > 0;
+            // Two-part gate: a LIVE memory pool AND session activity since the last
+            // successful run. The executor's file gate does the precise incremental
+            // partition; the scheduler only avoids taking the memory lease when there
+            // is no pool or no new session activity.
+            return countLiveMemories(db, project) > 0 && hasSessionActivitySince(ctx, lastRunAt);
 
         case "verify-broad":
             // Keep an open cycle runnable even when another task removed the last
             // active memory; the executor then closes the now-empty cycle. A closed
-            // cycle still needs an active pool before taking the memory lease.
+            // cycle still needs a live pool AND session activity since the last
+            // successful run before taking the memory lease.
             return (
                 getTaskScheduleState(db, project, "verify-broad")?.lastBroadRunAt != null ||
-                countLiveMemories(db, project) > 0
+                (countLiveMemories(db, project) > 0 && hasSessionActivitySince(ctx, lastRunAt))
             );
 
         case "curate":
             // Curate owns expiry hygiene, so its gate intentionally uses the raw
             // status pool: an expired-only project still needs one transition run.
-            return countActiveMemories(db, project) > 0;
+            // It additionally requires session activity since the last successful
+            // run, so a quiet project defers its expired-memory archive rather than
+            // spending a whole-pool LLM pass on an untouched project.
+            return countActiveMemories(db, project) > 0 && hasSessionActivitySince(ctx, lastRunAt);
 
         case "compress-cues":
-            // Cheap pre-gate: only take the memory lease when a live pool exists. The
-            // executor's selectCandidates does the precise NULL/stale-hash cue
-            // partition and no-ops when everything is already compressed.
-            return countLiveMemories(db, project) > 0;
+            // Two-part gate: a live pool AND session activity since the last
+            // successful run. The executor's selectCandidates does the precise
+            // NULL/stale-hash cue partition and no-ops when everything is already
+            // compressed.
+            return countLiveMemories(db, project) > 0 && hasSessionActivitySince(ctx, lastRunAt);
 
         case "classify-memories":
-            // Classification scores the live project memory pool directly. It has
-            // no file gate, watermark, or completeness prerequisites.
-            return countLiveMemories(db, project) > 0;
+            // Two-part gate: a live pool AND session activity since the last
+            // successful run — classification scores the live project memory pool
+            // directly.
+            return countLiveMemories(db, project) > 0 && hasSessionActivitySince(ctx, lastRunAt);
 
         case "retrospective":
             // Cheap pre-gate: any project ROOT session with a message newer than the

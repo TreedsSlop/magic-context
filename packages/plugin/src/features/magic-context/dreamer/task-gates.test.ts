@@ -12,6 +12,7 @@ import {
 } from "../memory";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
+import { writeTaskScheduleState } from "./storage-task-schedule";
 import { evaluateTaskGate, getDreamTaskBacklog } from "./task-gates";
 import { formatDreamTaskBacklogs, processedDreamTaskItems } from "./task-registry";
 
@@ -376,5 +377,124 @@ describe("retrospective gate — message activity (session message store)", () =
                 messageActivity: stubActivity(null),
             }),
         ).toEqual({ pending: 1, total: 1 });
+    });
+});
+
+/** Give a project an active memory so memory-domain pool checks pass. */
+let memorySeq = 0;
+function seedActiveMemory(d: Database, project = "/repo/project"): void {
+    memorySeq += 1;
+    insertMemory(d, {
+        projectPath: project,
+        category: "PROJECT_RULES",
+        content: `mem-${memorySeq}`,
+    });
+}
+
+describe("evaluateTaskGate — memory tasks on session activity", () => {
+    const MEMORY_TASKS = ["verify", "curate", "compress-cues", "classify-memories"] as const;
+    const projectIdentity = "/repo/project";
+
+    test("memory tasks need a pool AND session activity since the last run", () => {
+        db = freshDb();
+        seedActiveMemory(db, projectIdentity);
+        for (const task of MEMORY_TASKS) {
+            expect(
+                evaluateTaskGate(task, {
+                    db,
+                    projectIdentity,
+                    lastRunAt: Date.now(),
+                    promotionThreshold: 3,
+                    messageActivity: stubActivity(0),
+                }),
+            ).toBe(false);
+            expect(
+                evaluateTaskGate(task, {
+                    db,
+                    projectIdentity,
+                    lastRunAt: Date.now(),
+                    promotionThreshold: 3,
+                    messageActivity: stubActivity(1),
+                }),
+            ).toBe(true);
+        }
+    });
+
+    test("memory tasks treat an unavailable message store as activity (conservative)", () => {
+        db = freshDb();
+        seedActiveMemory(db, projectIdentity);
+        for (const task of MEMORY_TASKS) {
+            expect(
+                evaluateTaskGate(task, {
+                    db,
+                    projectIdentity,
+                    lastRunAt: Date.now(),
+                    promotionThreshold: 3,
+                    messageActivity: stubActivity(null),
+                }),
+            ).toBe(true);
+        }
+    });
+
+    test("memory tasks still need a pool even when sessions changed", () => {
+        db = freshDb();
+        for (const task of MEMORY_TASKS) {
+            expect(
+                evaluateTaskGate(task, {
+                    db,
+                    projectIdentity,
+                    lastRunAt: Date.now(),
+                    promotionThreshold: 3,
+                    messageActivity: stubActivity(1),
+                }),
+            ).toBe(false);
+        }
+    });
+
+    test("verify-broad keeps an open cycle runnable with zero activity", () => {
+        db = freshDb();
+        writeTaskScheduleState(db, {
+            projectPath: projectIdentity,
+            task: "verify-broad",
+            lastRunAt: null,
+            nextDueAt: Date.now() - 1000,
+            schedule: "0 3 * * 0",
+            lastStatus: null,
+            lastError: null,
+            retryCount: 0,
+            lastBroadRunAt: 123,
+        });
+        expect(
+            evaluateTaskGate("verify-broad", {
+                db,
+                projectIdentity,
+                lastRunAt: null,
+                promotionThreshold: 3,
+                messageActivity: stubActivity(0),
+            }),
+        ).toBe(true);
+    });
+
+    test("verify-broad with a closed cycle requires pool AND activity", () => {
+        db = freshDb();
+        seedActiveMemory(db, projectIdentity);
+        expect(
+            evaluateTaskGate("verify-broad", {
+                db,
+                projectIdentity,
+                lastRunAt: Date.now(),
+                promotionThreshold: 3,
+                messageActivity: stubActivity(0),
+            }),
+        ).toBe(false);
+        expect(
+            evaluateTaskGate("verify-broad", {
+                db,
+                projectIdentity,
+                lastRunAt: Date.now(),
+                promotionThreshold: 3,
+                messageActivity: stubActivity(1),
+            }),
+        ).toBe(true);
     });
 });
