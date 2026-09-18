@@ -9,6 +9,7 @@ import {
     leaseOwnershipMatches,
     releaseLease,
 } from "./lease";
+import type { MessageActivityProvider } from "./message-activity";
 import { getDreamState } from "./storage-dream-state";
 import {
     getTaskScheduleState,
@@ -88,6 +89,9 @@ export interface RunDueTasksDeps {
     tasks: readonly DreamTaskRuntimeConfig[];
     executor: TaskExecutor;
     now?: number;
+    /** Optional message-activity signal from the session message store; absent →
+     *  legacy gates apply (see task-gates). */
+    messageActivity?: MessageActivityProvider;
 }
 
 /** First-seed a task's schedule row if absent. next_due_at from cron(after now);
@@ -361,6 +365,7 @@ async function runDomainGroup(
                         due.config.task,
                     ),
                     promotionThreshold: due.config.promotionThreshold ?? 3,
+                    messageActivity: deps.messageActivity,
                 });
                 if (!gatePass) {
                     advanceAfterRun(db, projectIdentity, due, Date.now(), "skipped", null);
@@ -471,7 +476,9 @@ export async function runManualDream(
     if (selected.length === 0) return result;
 
     const selectedTaskNames = selected.map((config) => config.task);
-    result.backlogBefore = getDreamTaskBacklogs(deps.db, deps.projectIdentity, selectedTaskNames);
+    result.backlogBefore = getDreamTaskBacklogs(deps.db, deps.projectIdentity, selectedTaskNames, {
+        messageActivity: deps.messageActivity,
+    });
     result.backlogAfter = { ...result.backlogBefore };
 
     // Seed rows so completion advancement has a row to update.
@@ -497,6 +504,7 @@ export async function runManualDream(
                 d.config.task,
             ),
             promotionThreshold: d.config.promotionThreshold ?? 3,
+            messageActivity: deps.messageActivity,
         });
         if (pass) gated.push(d);
         else result.skippedNoWork.push(d.config.task);
@@ -506,6 +514,7 @@ export async function runManualDream(
             deps.db,
             deps.projectIdentity,
             selectedTaskNames,
+            { messageActivity: deps.messageActivity },
         );
         return result;
     }
@@ -538,7 +547,9 @@ export async function runManualDream(
         ),
     );
     result.backlogAfter = {
-        ...getDreamTaskBacklogs(deps.db, deps.projectIdentity, selectedTaskNames),
+        ...getDreamTaskBacklogs(deps.db, deps.projectIdentity, selectedTaskNames, {
+            messageActivity: deps.messageActivity,
+        }),
         ...runLocalBacklogs,
     };
     return result;
@@ -569,6 +580,7 @@ export async function runDueTasksForProject(deps: RunDueTasksDeps): Promise<numb
                 d.config.task,
             ),
             promotionThreshold: d.config.promotionThreshold ?? 3,
+            messageActivity: deps.messageActivity,
         });
         if (pass) {
             gated.push(d);

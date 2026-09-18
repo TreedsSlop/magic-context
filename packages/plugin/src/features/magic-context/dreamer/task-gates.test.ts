@@ -280,3 +280,101 @@ describe("evaluateTaskGate", () => {
         ).toBe(false);
     });
 });
+
+/** Stub message-activity provider returning a fixed count (null = store down). */
+function stubActivity(count: number | null): {
+    countRootSessionsWithMessagesSince: () => number | null;
+} {
+    return { countRootSessionsWithMessagesSince: () => count };
+}
+
+describe("retrospective gate — message activity (session message store)", () => {
+    const projectIdentity = "/repo/project";
+
+    test("gates on message activity, allowing when the store is down", () => {
+        db = freshDb();
+        expect(
+            evaluateTaskGate("retrospective", {
+                db,
+                projectIdentity,
+                lastRunAt: null,
+                retrospectiveWatermarkMs: 100,
+                promotionThreshold: 3,
+                messageActivity: stubActivity(0),
+            }),
+        ).toBe(false);
+        expect(
+            evaluateTaskGate("retrospective", {
+                db,
+                projectIdentity,
+                lastRunAt: null,
+                retrospectiveWatermarkMs: 100,
+                promotionThreshold: 3,
+                messageActivity: stubActivity(1),
+            }),
+        ).toBe(true);
+        expect(
+            evaluateTaskGate("retrospective", {
+                db,
+                projectIdentity,
+                lastRunAt: null,
+                retrospectiveWatermarkMs: 100,
+                promotionThreshold: 3,
+                messageActivity: stubActivity(null),
+            }),
+        ).toBe(true);
+    });
+
+    test("forwards the CONTENT watermark to the provider", () => {
+        db = freshDb();
+        const seen: (number | null)[] = [];
+        const capturing = {
+            countRootSessionsWithMessagesSince: (_project: string, sinceMs: number | null) => {
+                seen.push(sinceMs);
+                return 1;
+            },
+        };
+        // Unset watermark → provider sees null (never-run → any root session).
+        evaluateTaskGate("retrospective", {
+            db,
+            projectIdentity,
+            lastRunAt: null,
+            retrospectiveWatermarkMs: undefined,
+            promotionThreshold: 3,
+            messageActivity: capturing,
+        });
+        // Set watermark → forwarded verbatim.
+        evaluateTaskGate("retrospective", {
+            db,
+            projectIdentity,
+            lastRunAt: null,
+            retrospectiveWatermarkMs: 500,
+            promotionThreshold: 3,
+            messageActivity: capturing,
+        });
+        expect(seen).toEqual([null, 500]);
+    });
+
+    test("backlog uses the provider count when present", () => {
+        db = freshDb();
+        expect(
+            getDreamTaskBacklog(db, projectIdentity, "retrospective", {
+                retrospectiveWatermarkMs: 100,
+                messageActivity: stubActivity(3),
+            }),
+        ).toEqual({ pending: 3, total: 3 });
+    });
+
+    test("backlog falls back to the updated_at count when the provider is null", () => {
+        db = freshDb();
+        db.prepare(
+            "INSERT INTO session_projects (session_id, harness, project_path, updated_at) VALUES (?, ?, ?, ?)",
+        ).run("s1", "opencode", projectIdentity, 200);
+        expect(
+            getDreamTaskBacklog(db, projectIdentity, "retrospective", {
+                retrospectiveWatermarkMs: 100,
+                messageActivity: stubActivity(null),
+            }),
+        ).toEqual({ pending: 1, total: 1 });
+    });
+});

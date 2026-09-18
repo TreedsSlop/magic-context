@@ -3,6 +3,7 @@ import { statSync } from "node:fs";
 import type { DreamerConfig } from "../config/schema/magic-context";
 import type { ClassifyModuleClient } from "../features/magic-context/dreamer/classify";
 import { acquireLease, releaseLease } from "../features/magic-context/dreamer/lease";
+import { createMessageActivityProvider } from "../features/magic-context/dreamer/message-activity";
 import { openOpenCodeDb } from "../features/magic-context/dreamer/open-opencode-db";
 import {
     historianOrphanStaleMs,
@@ -537,14 +538,20 @@ async function sweepProject(
             onProgress: (progress, completedTask) =>
                 reg.onDreamerProgress?.(progress, completedTask),
         });
-        const ran = await runDueTasksForProject({
-            db,
-            projectIdentity: reg.projectIdentity,
-            tasks: runtimeConfigs,
-            executor,
-        });
-        if (ran > 0) {
-            log(`[dreamer] timer tick (${origin}) ${reg.projectIdentity} — ran ${ran} task(s)`);
+        const messageActivity = createMessageActivityProvider({ contextDb: db, openOpenCodeDb });
+        try {
+            const ran = await runDueTasksForProject({
+                db,
+                projectIdentity: reg.projectIdentity,
+                tasks: runtimeConfigs,
+                executor,
+                messageActivity,
+            });
+            if (ran > 0) {
+                log(`[dreamer] timer tick (${origin}) ${reg.projectIdentity} — ran ${ran} task(s)`);
+            }
+        } finally {
+            messageActivity.dispose();
         }
     } catch (error) {
         log(`[dreamer] timer-triggered task scheduling failed for ${reg.projectIdentity}:`, error);

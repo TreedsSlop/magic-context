@@ -690,3 +690,27 @@ describe("task-scheduler — runManualDream", () => {
         expect(result.ran).toEqual([]);
     });
 });
+
+/** Stub message-activity provider returning a fixed count (null = store down). */
+function stubActivity(count: number | null): {
+    countRootSessionsWithMessagesSince: () => number | null;
+} {
+    return { countRootSessionsWithMessagesSince: () => count };
+}
+
+describe("task-scheduler — message-activity provider threading", () => {
+    it("runManualDream forwards the provider to retrospective backlog probes", async () => {
+        db = freshDb();
+        const tasks = [cfg("retrospective", "0 3 * * *")];
+        const executor = async (): Promise<TaskExecOutcome> => ({ status: "completed" });
+        const result = await runManualDream({
+            db,
+            projectIdentity: PROJECT,
+            tasks,
+            executor,
+            task: "retrospective",
+            messageActivity: stubActivity(3),
+        });
+        expect(result.backlogBefore.retrospective).toEqual({ pending: 3, total: 3 });
+    });
+});

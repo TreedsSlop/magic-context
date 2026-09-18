@@ -105,14 +105,15 @@ class ScriptedProvider implements RetrospectiveRawProvider {
     constructor(
         private readonly sessions: string[],
         private readonly rowsBySession: Map<string, RetrospectiveRawMessage[]>,
+        /** Decouples updated_at (registration time) from the row timestamps. */
+        private readonly updatedAtOverride?: Map<string, number>,
     ) {}
     listProjectSessions(): RetrospectiveProjectSession[] {
         return this.sessions.map((sessionId) => ({
             sessionId,
-            updatedAt: Math.max(
-                0,
-                ...(this.rowsBySession.get(sessionId) ?? []).map((row) => row.ts),
-            ),
+            updatedAt:
+                this.updatedAtOverride?.get(sessionId) ??
+                Math.max(0, ...(this.rowsBySession.get(sessionId) ?? []).map((row) => row.ts)),
         }));
     }
     readUserMessagesSince(
@@ -182,6 +183,60 @@ describe("readRetrospectiveScanWindow", () => {
         const win = await readRetrospectiveScanWindow(provider, "proj", 0, 12);
         expect(win.messages.map((m) => m.text).sort()).toEqual(["a", "b"]);
         expect(win.maxScannedTs).toBe(200);
+    });
+
+    test("eligibility: a session registered BEFORE the watermark is still scanned (under-scan fix)", async () => {
+        // updated_at is REGISTRATION time (100), not activity. The old
+        // updatedAt > watermark filter excluded this session forever despite its
+        // real messages past the watermark; eligibility comes from the frontier.
+        const rows = new Map([
+            ["s1", [u("s1", 100, "old1"), u("s1", 250, "new1"), u("s1", 300, "new2")]],
+        ]);
+        const updatedAtOverride = new Map([["s1", 100]]);
+        const provider = new ScriptedProvider(["s1"], rows, updatedAtOverride);
+
+        const win = await readRetrospectiveScanWindow(provider, "proj", 250, 0);
+        expect(win.messages.map((m) => m.text)).toEqual(["new2"]);
+        expect(win.maxScannedTs).toBe(300);
+    });
+
+    test("eligibility: a backfilled session registered AFTER the watermark is NOT scanned (over-scan fix)", async () => {
+        // updated_at (300) is backfill/registration time, not activity: s2's real
+        // messages are all ≤ the watermark, so it must not re-enter the scan each
+        // run. s1 (registered long ago but with a new message) makes the spurious
+        // eligibility observable: the window must contain ONLY s1's new message.
+        const rows = new Map([
+            ["s1", [u("s1", 100, "old1"), u("s1", 200, "old2"), u("s1", 300, "new1")]],
+            ["s2", [u("s2", 100, "x"), u("s2", 150, "y"), u("s2", 200, "z")]],
+        ]);
+        const updatedAtOverride = new Map([
+            ["s1", 100],
+            ["s2", 300],
+        ]);
+        const provider = new ScriptedProvider(["s1", "s2"], rows, updatedAtOverride);
+
+        const win = await readRetrospectiveScanWindow(provider, "proj", 250, 0);
+        expect(win.messages.map((m) => m.text)).toEqual(["new1"]);
+        expect(win.messages.every((m) => m.sessionId === "s1")).toBe(true);
+    });
+
+    test("fallback: a provider without an indexed frontier keeps updatedAt-based eligibility", async () => {
+        // Non-indexed providers lack readOldestMessageTimesSince; the updated_at
+        // filter is their only eligibility signal and must still exclude stale
+        // sessions (registration time ≤ watermark).
+        const provider: RetrospectiveRawProvider = {
+            listProjectSessions: () => [
+                { sessionId: "active", updatedAt: 500 },
+                { sessionId: "stale", updatedAt: 100 },
+            ],
+            readUserMessagesSince: (sessionId) => ({
+                messages: sessionId === "active" ? [u("active", 400, "fresh")] : [],
+                truncated: false,
+            }),
+            readUserMessagesBefore: () => [],
+        };
+        const win = await readRetrospectiveScanWindow(provider, "proj", 250, 0);
+        expect(win.messages.map((m) => m.text)).toEqual(["fresh"]);
     });
 
     test("backlog: keeps the OLDEST since-rows and never advances the watermark past a dropped row (global cap)", async () => {

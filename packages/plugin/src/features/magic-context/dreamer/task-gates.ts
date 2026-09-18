@@ -9,6 +9,7 @@ import { getPendingSmartNotes } from "../storage-notes";
 import { countPrimerCandidatesForProject, getActivePrimers } from "../storage-primers";
 import { getUserMemoryCandidates } from "../user-memory/storage-user-memory";
 import { peekCurateCategoryScope } from "./curate-category-rotation";
+import type { MessageActivityProvider } from "./message-activity";
 import { getTaskScheduleState } from "./storage-task-schedule";
 import {
     CANONICAL_DREAM_TASKS,
@@ -37,6 +38,9 @@ export interface TaskGateContext {
     retrospectiveWatermarkMs?: number | null;
     /** review-user-memories: min candidate observations before a review is worthwhile. */
     promotionThreshold: number;
+    /** Optional message-activity signal (session message store). Absent → legacy
+     *  gates; a provider returning null (store unavailable) → conservative allow. */
+    messageActivity?: MessageActivityProvider;
 }
 
 /** Raw status count used only to let curate transition expired active rows. */
@@ -236,7 +240,11 @@ export function getDreamTaskBacklog(
     db: Database,
     projectPath: string,
     task: DreamTaskName,
-    options: { lastRunAt?: number | null; retrospectiveWatermarkMs?: number | null } = {},
+    options: {
+        lastRunAt?: number | null;
+        retrospectiveWatermarkMs?: number | null;
+        messageActivity?: MessageActivityProvider;
+    } = {},
 ): DreamTaskBacklog {
     switch (task) {
         case "map-memories": {
@@ -292,11 +300,11 @@ export function getDreamTaskBacklog(
             };
         }
         case "retrospective": {
-            const pending = countProjectSessionsSince(
-                db,
-                projectPath,
-                options.retrospectiveWatermarkMs ?? null,
-            );
+            const since = options.retrospectiveWatermarkMs ?? null;
+            const pending = options.messageActivity
+                ? (options.messageActivity.countRootSessionsWithMessagesSince(projectPath, since) ??
+                  countProjectSessionsSince(db, projectPath, since))
+                : countProjectSessionsSince(db, projectPath, since);
             return { pending, total: pending };
         }
         case "maintain-docs": {
@@ -332,7 +340,11 @@ export function getDreamTaskBacklogs(
     db: Database,
     projectPath: string,
     tasks: readonly DreamTaskName[] = CANONICAL_DREAM_TASKS,
-    options: { lastRunAt?: number | null; retrospectiveWatermarkMs?: number | null } = {},
+    options: {
+        lastRunAt?: number | null;
+        retrospectiveWatermarkMs?: number | null;
+        messageActivity?: MessageActivityProvider;
+    } = {},
 ): DreamTaskBacklogMap {
     const result: DreamTaskBacklogMap = {};
     for (const task of tasks) result[task] = getDreamTaskBacklog(db, projectPath, task, options);
@@ -384,11 +396,20 @@ export function evaluateTaskGate(task: DreamTaskName, ctx: TaskGateContext): boo
             return countLiveMemories(db, project) > 0;
 
         case "retrospective":
-            // Cheap pre-gate: any project session updated since the CONTENT
-            // watermark (max message ts actually scanned), not lastRunAt — a
-            // session updated mid-run would otherwise be skipped. The executor's
-            // raw provider does the precise typed-user-message scan and bails
-            // before any child session if empty. Never-run → "sessions exist".
+            // Cheap pre-gate: any project ROOT session with a message newer than the
+            // CONTENT watermark (max message ts actually scanned), not lastRunAt and
+            // not session_projects.updated_at — which records first-binding/backfill
+            // time, so it over-scans backfilled sessions and under-scans active ones.
+            // The executor's raw provider does the precise typed-user-message scan
+            // and bails before any child session if empty. Never-run → any root
+            // session; an unavailable message store → conservative allow.
+            if (ctx.messageActivity) {
+                const count = ctx.messageActivity.countRootSessionsWithMessagesSince(
+                    project,
+                    ctx.retrospectiveWatermarkMs ?? null,
+                );
+                return count === null ? true : count > 0;
+            }
             return countProjectSessionsSince(db, project, ctx.retrospectiveWatermarkMs ?? null) > 0;
 
         case "maintain-docs":

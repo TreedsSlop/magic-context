@@ -19,6 +19,7 @@ import {
     getModuleNoteEvaluationBridge,
     registerModuleNoteEvaluationBridge,
 } from "../../features/magic-context/context-authority";
+import { createMessageActivityProvider } from "../../features/magic-context/dreamer/message-activity";
 import { openOpenCodeDb } from "../../features/magic-context/dreamer/open-opencode-db";
 import { OpenCodeRetrospectiveRawProvider } from "../../features/magic-context/dreamer/retrospective-raw-provider";
 import {
@@ -1335,14 +1336,20 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 }
             },
         });
+        const messageActivity = createMessageActivityProvider({ contextDb: db, openOpenCodeDb });
         void runDueTasksForProject({
             db,
             projectIdentity: projectPath,
             tasks: runtimeConfigs,
             executor,
-        }).catch((error: unknown) => {
-            log("[dreamer] scheduled task run failed:", error);
-        });
+            messageActivity,
+        })
+            .catch((error: unknown) => {
+                log("[dreamer] scheduled task run failed:", error);
+            })
+            .finally(() => {
+                messageActivity.dispose();
+            });
     };
 
     const commandHandler = createMagicContextCommandHandler({

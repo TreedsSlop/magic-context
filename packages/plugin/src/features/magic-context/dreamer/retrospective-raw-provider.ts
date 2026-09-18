@@ -73,9 +73,37 @@ interface OpenCodeRetrospectiveRawProviderDeps {
     opencodeDb?: Database;
 }
 
-interface SessionProjectRow {
+export interface SessionProjectRow {
     session_id: string;
     updated_at?: number | null;
+}
+
+/**
+ * ROOT sessions of the project, oldest-first. Shared by the retrospective
+ * provider and the message-activity gate so both scope sessions with one
+ * canonical SQL. The retrospective learns from USER friction, but a subagent
+ * child (oracle / mason / historian / dreamer) has no user — its "user
+ * messages" are agent-authored task prompts whose audit/spec wording ("fail",
+ * "error", "wrong", "no padding") trips the frustration regex and whose tool
+ * fan-out trips repeated-tool-call. In a delegation-heavy period children also
+ * outnumber roots ~30:1, so a bounded session scan can be entirely consumed by
+ * them and the real user session is never scanned. is_subagent lives in
+ * session_meta (same DB); missing meta → treat as root.
+ */
+export function selectProjectSessions(
+    contextDb: Database,
+    projectIdentity: string,
+): SessionProjectRow[] {
+    return contextDb
+        .prepare<[string], SessionProjectRow>(
+            `SELECT sp.session_id, sp.updated_at
+               FROM session_projects sp
+               LEFT JOIN session_meta m ON m.session_id = sp.session_id
+              WHERE sp.project_path = ? AND sp.harness = 'opencode'
+                AND COALESCE(m.is_subagent, 0) = 0
+              ORDER BY sp.updated_at ASC, sp.session_id ASC`,
+        )
+        .all(projectIdentity);
 }
 
 interface OpenCodeMessageRow {
@@ -103,25 +131,7 @@ export class OpenCodeRetrospectiveRawProvider implements RetrospectiveRawProvide
     }
 
     listProjectSessions(projectIdentity: string): RetrospectiveProjectSession[] {
-        // ROOT sessions only. The retrospective learns from USER friction, but a
-        // subagent child (oracle / mason / historian / dreamer) has no user — its
-        // "user messages" are agent-authored task prompts whose audit/spec wording
-        // ("fail", "error", "wrong", "no padding") trips the frustration regex and
-        // whose tool fan-out trips repeated-tool-call. In a delegation-heavy period
-        // children also outnumber roots ~30:1, so a bounded session scan can be
-        // entirely consumed by them and the real user session is never scanned.
-        // is_subagent lives in session_meta (same DB); missing meta → treat as root.
-        const rows = this.deps.contextDb
-            .prepare<[string], SessionProjectRow>(
-                `SELECT sp.session_id, sp.updated_at
-                   FROM session_projects sp
-                   LEFT JOIN session_meta m ON m.session_id = sp.session_id
-                  WHERE sp.project_path = ? AND sp.harness = 'opencode'
-                    AND COALESCE(m.is_subagent, 0) = 0
-                  ORDER BY sp.updated_at ASC, sp.session_id ASC`,
-            )
-            .all(projectIdentity);
-        return rows.map((row) => ({
+        return selectProjectSessions(this.deps.contextDb, projectIdentity).map((row) => ({
             sessionId: row.session_id,
             updatedAt: typeof row.updated_at === "number" ? row.updated_at : undefined,
         }));
@@ -220,15 +230,23 @@ export async function readRetrospectiveScanWindow(
     );
     try {
         const allSessions = await provider.listProjectSessions(projectIdentity);
-        const eligibleSessions = allSessions
-            .map((session, index) => ({ session, index }))
-            .filter(({ session }) => (session.updatedAt ?? Number.POSITIVE_INFINITY) > watermarkMs);
+        // Eligibility is message activity, not the registration-time updated_at column.
+        // readOldestMessageTimesSince computes exactly "has a message newer than the
+        // watermark" over the message table; only providers without an indexed store
+        // fall back to the updated_at filter.
         const oldestBySession = provider.readOldestMessageTimesSince
             ? await provider.readOldestMessageTimesSince(
-                  eligibleSessions.map(({ session }) => session.sessionId),
+                  allSessions.map((session) => session.sessionId),
                   watermarkMs,
               )
             : null;
+        const eligibleSessions = (
+            oldestBySession
+                ? allSessions.filter((session) => oldestBySession.has(session.sessionId))
+                : allSessions.filter(
+                      (session) => (session.updatedAt ?? Number.POSITIVE_INFINITY) > watermarkMs,
+                  )
+        ).map((session, index) => ({ session, index }));
         const sessions = (
             oldestBySession
                 ? eligibleSessions.filter(({ session }) => oldestBySession.has(session.sessionId))
@@ -381,7 +399,7 @@ function readOpenCodeMessagesSince(
     return { messages: normalizeOpenCodeRows(db, sessionId, kept), truncated };
 }
 
-function readOpenCodeOldestMessageTimesSince(
+export function readOpenCodeOldestMessageTimesSince(
     db: Database,
     sessionIds: readonly string[],
     sinceMs: number,
